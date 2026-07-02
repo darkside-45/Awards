@@ -8,22 +8,94 @@ interface VoterSetupProps {
   onClose: () => void;
 }
 
+// Normalise une chaîne pour la comparaison : minuscules, sans accents,
+// sans espaces superflus et sans ponctuation.
+function normalize(str: string): string {
+  return str
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // enlève les accents
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Distance de Levenshtein classique.
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  const dp: number[] = Array(n + 1).fill(0).map((_, i) => i);
+
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const temp = dp[j];
+      dp[j] = a[i - 1] === b[j - 1]
+        ? prev
+        : 1 + Math.min(prev, dp[j], dp[j - 1]);
+      prev = temp;
+    }
+  }
+  return dp[n];
+}
+
+// Ratio de similarité entre 0 (rien en commun) et 1 (identique).
+function similarity(a: string, b: string): number {
+  const na = normalize(a);
+  const nb = normalize(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  // Si l'une contient l'autre (ex: caractères en trop), on considère
+  // que c'est une correspondance quasi parfaite.
+  if (na.includes(nb) || nb.includes(na)) return 0.95;
+  const dist = levenshtein(na, nb);
+  const maxLen = Math.max(na.length, nb.length);
+  return 1 - dist / maxLen;
+}
+
+// En dessous de ce seuil, on considère que le nom saisi ne correspond pas
+// à la classe sélectionnée. Volontairement permissif pour tolérer les
+// fautes de frappe et les caractères en trop.
+const MATCH_THRESHOLD = 0.55;
+
 export default function VoterSetup({ onComplete, onClose }: VoterSetupProps) {
   const { classes, voter, setVoter } = useApp();
   const [displayName, setDisplayName] = useState('');
   const [classId, setClassId] = useState('');
+  const [classNameInput, setClassNameInput] = useState('');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   if (voter) return null;
 
+  const selectedClass = classes.find((c) => c.id === classId);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
-    if (!displayName.trim() || !classId) {
+
+    if (!displayName.trim() || !classId || !classNameInput.trim()) {
       setError('Veuillez remplir tous les champs');
       return;
     }
+
+    if (!selectedClass) {
+      setError('Classe invalide, veuillez réessayer.');
+      return;
+    }
+
+    if (similarity(classNameInput, selectedClass.name) < MATCH_THRESHOLD) {
+      setError(
+        `Le nom saisi ne correspond pas à la classe sélectionnée (${selectedClass.name}). Vérifiez l'orthographe.`
+      );
+      return;
+    }
+
     setSubmitting(true);
     try {
       const token = crypto.randomUUID();
@@ -99,6 +171,29 @@ export default function VoterSetup({ onComplete, onClose }: VoterSetupProps) {
               </select>
               <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400 pointer-events-none" />
             </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-poppins font-medium text-gray-700 mb-1.5">
+              Confirmez le nom de votre classe
+            </label>
+            {/* Champ volontairement en texte visible (pas de type="password") :
+                l'utilisateur doit pouvoir vérifier ce qu'il écrit. La comparaison
+                avec le nom réel de la classe tolère les fautes de frappe. */}
+            <input
+              type="text"
+              autoComplete="off"
+              autoCapitalize="off"
+              autoCorrect="off"
+              spellCheck={false}
+              value={classNameInput}
+              onChange={(e) => setClassNameInput(e.target.value)}
+              className="w-full px-4 py-3 rounded-xl border border-gray-200 focus:border-primary-900 focus:ring-2 focus:ring-primary-900/20 outline-none transition-all font-lato"
+              placeholder="Ex : Terminale D2"
+            />
+            <p className="text-xs text-gray-400 font-lato mt-1">
+              Petites fautes ou lettres en trop ? Pas de souci, tant que c'est reconnaissable.
+            </p>
           </div>
 
           {error && (
