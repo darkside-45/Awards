@@ -1,15 +1,15 @@
-import { useState, useMemo, useRef } from 'react';
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { useApp } from '../lib/context';
 import { supabase } from '../lib/supabase';
 import { uploadFile } from '../lib/upload';
 import { CommentModerationItem } from '../components/CandidateCard';
 import AdminLogin from '../components/AdminLogin';
 import { LEVEL_NAMES, LEVEL_DESCRIPTIONS } from '../lib/types';
-import type { Comment as TComment } from '../lib/types';
+import type { Comment as TComment, Vote } from '../lib/types';
 import {
   BarChart3, Users, Tag, MessageSquare, Settings, Trophy,
   ChevronRight, Plus, Trash2, CheckCircle, AlertTriangle, RefreshCw,
-  Calendar, Camera, Save,
+  Calendar, Camera, Save, Award, Medal,
 } from 'lucide-react';
 
 export default function AdminPanel() {
@@ -17,12 +17,42 @@ export default function AdminPanel() {
     level, classes, categories, candidates, comments, gala,
     isAdmin, setAdmin, refreshCandidates, refreshComments, refreshGala,
   } = useApp();
-  const [activeTab, setActiveTab] = useState<'overview' | 'level' | 'categories' | 'comments' | 'candidates' | 'gala'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'level' | 'categories' | 'comments' | 'candidates' | 'results' | 'gala'>('overview');
   const [newCatName, setNewCatName] = useState('');
   const [newCatDesc, setNewCatDesc] = useState('');
   const [newClassName, setNewClassName] = useState('');
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [processing, setProcessing] = useState(false);
+
+  // Voting results
+  const [votes, setVotes] = useState<Vote[]>([]);
+  const [totalVoters, setTotalVoters] = useState(0);
+  const [resultsLoading, setResultsLoading] = useState(false);
+
+  const refreshResults = useCallback(async () => {
+    setResultsLoading(true);
+    try {
+      const [votesRes, votersRes] = await Promise.all([
+        supabase.from('votes').select('*'),
+        supabase.from('voters').select('id', { count: 'exact', head: true }),
+      ]);
+      if (votesRes.data) setVotes(votesRes.data as Vote[]);
+      if (typeof votersRes.count === 'number') setTotalVoters(votersRes.count);
+    } finally {
+      setResultsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshResults();
+    const channel = supabase
+      .channel('admin-results-votes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'votes' }, () => {
+        refreshResults();
+      })
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [refreshResults]);
 
   // Gala settings
   const [galaDate, setGalaDate] = useState(gala?.gala_date ? gala.gala_date.slice(0, 16) : '');
@@ -41,6 +71,47 @@ export default function AdminPanel() {
       count: candidates.filter((c) => c.class_id === cls.id).length,
     })),
   }), [candidates, comments, categories, classes]);
+
+  const voteResults = useMemo(() => {
+    const countFor = (level: number) => {
+      const counts: Record<string, number> = {};
+      votes.filter((v) => v.level === level).forEach((v) => {
+        counts[v.candidate_id] = (counts[v.candidate_id] || 0) + 1;
+      });
+      return counts;
+    };
+    const level2Counts = countFor(2);
+    const level3Counts = countFor(3);
+
+    const level2Voters = new Set(votes.filter((v) => v.level === 2).map((v) => v.voter_id)).size;
+    const level3Voters = new Set(votes.filter((v) => v.level === 3).map((v) => v.voter_id)).size;
+
+    // Level 2: results grouped by class then category
+    const level2Groups: { classId: string; className: string; categoryId: string; categoryName: string; ranking: { candidate: typeof candidates[number]; count: number }[] }[] = [];
+    classes.forEach((cls) => {
+      categories.forEach((cat) => {
+        const group = candidates.filter((c) => c.class_id === cls.id && c.category_id === cat.id);
+        if (group.length === 0) return;
+        const ranking = group
+          .map((candidate) => ({ candidate, count: level2Counts[candidate.id] || 0 }))
+          .sort((a, b) => b.count - a.count);
+        level2Groups.push({ classId: cls.id, className: cls.name, categoryId: cat.id, categoryName: cat.name, ranking });
+      });
+    });
+
+    // Level 3: results grouped by category (qualified/finalist candidates)
+    const level3Groups: { categoryId: string; categoryName: string; ranking: { candidate: typeof candidates[number]; count: number }[] }[] = [];
+    categories.forEach((cat) => {
+      const group = candidates.filter((c) => c.category_id === cat.id && c.is_qualified);
+      if (group.length === 0) return;
+      const ranking = group
+        .map((candidate) => ({ candidate, count: level3Counts[candidate.id] || 0 }))
+        .sort((a, b) => b.count - a.count);
+      level3Groups.push({ categoryId: cat.id, categoryName: cat.name, ranking });
+    });
+
+    return { level2Voters, level3Voters, level2Groups, level3Groups };
+  }, [votes, candidates, categories, classes]);
 
   if (!isAdmin) {
     return <AdminLogin onLogin={() => setAdmin(true)} />;
@@ -183,6 +254,7 @@ export default function AdminPanel() {
     { id: 'categories' as const, label: 'Catégories & Classes', icon: Tag },
     { id: 'comments' as const, label: 'Commentaires', icon: MessageSquare },
     { id: 'candidates' as const, label: 'Candidats', icon: Users },
+    { id: 'results' as const, label: 'Résultats', icon: Award },
     { id: 'gala' as const, label: 'Grand Bal', icon: Calendar },
   ];
 
@@ -522,6 +594,144 @@ export default function AdminPanel() {
                 </tbody>
               </table>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Voting Results */}
+      {activeTab === 'results' && (
+        <div className="space-y-8">
+          <div className="flex items-center justify-between">
+            <h3 className="font-poppins font-bold text-lg text-gray-900">Résultats des votes</h3>
+            <button onClick={() => refreshResults()}
+              className="flex items-center gap-1.5 px-3 py-2 text-sm text-primary-900 hover:bg-primary-900/5 rounded-lg font-poppins font-medium transition-all">
+              <RefreshCw className={`w-4 h-4 ${resultsLoading ? 'animate-spin' : ''}`} /> Actualiser
+            </button>
+          </div>
+
+          {/* Participation par étape */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+              <p className="font-poppins font-medium text-sm text-gray-500 mb-2">Votants inscrits</p>
+              <p className="font-poppins font-bold text-3xl text-gray-900">{totalVoters}</p>
+            </div>
+            <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+              <p className="font-poppins font-medium text-sm text-gray-500 mb-2">
+                Niveau 2 — Vote Intra-Classes
+              </p>
+              <p className="font-poppins font-bold text-3xl text-gray-900">
+                {voteResults.level2Voters}
+                <span className="text-base font-medium text-gray-400"> / {totalVoters}</span>
+              </p>
+              <div className="h-2 bg-gray-100 rounded-full overflow-hidden mt-2">
+                <div className="h-full bg-primary-900 rounded-full"
+                  style={{ width: `${totalVoters > 0 ? (voteResults.level2Voters / totalVoters) * 100 : 0}%` }} />
+              </div>
+            </div>
+            <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+              <p className="font-poppins font-medium text-sm text-gray-500 mb-2">
+                Niveau 3 — Vote Inter-Classes
+              </p>
+              <p className="font-poppins font-bold text-3xl text-gray-900">
+                {voteResults.level3Voters}
+                <span className="text-base font-medium text-gray-400"> / {totalVoters}</span>
+              </p>
+              <div className="h-2 bg-gray-100 rounded-full overflow-hidden mt-2">
+                <div className="h-full bg-primary-900 rounded-full"
+                  style={{ width: `${totalVoters > 0 ? (voteResults.level3Voters / totalVoters) * 100 : 0}%` }} />
+              </div>
+            </div>
+          </div>
+
+          {/* Niveau 2 results */}
+          <div>
+            <h4 className="font-poppins font-bold text-base text-gray-900 mb-3 flex items-center gap-2">
+              <BarChart3 className="w-4 h-4 text-primary-900" />
+              Résultats — Vote Intra-Classes (Niveau 2)
+            </h4>
+            {voteResults.level2Groups.length === 0 ? (
+              <div className="text-center py-10 bg-white rounded-2xl border border-gray-100">
+                <p className="font-lato text-gray-400">Aucun candidat inscrit pour le moment.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {voteResults.level2Groups.map((g) => (
+                  <div key={`${g.classId}_${g.categoryId}`} className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+                    <p className="font-poppins font-semibold text-sm text-gray-900 mb-0.5">{g.categoryName}</p>
+                    <p className="font-lato text-xs text-gray-400 mb-3">{g.className}</p>
+                    <div className="space-y-2">
+                      {g.ranking.map((r, i) => (
+                        <div key={r.candidate.id} className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            {i === 0 ? (
+                              <Medal className="w-4 h-4 text-yellow-500" />
+                            ) : i === 1 ? (
+                              <Medal className="w-4 h-4 text-gray-400" />
+                            ) : i === 2 ? (
+                              <Medal className="w-4 h-4 text-orange-400" />
+                            ) : (
+                              <span className="w-4 h-4 text-center text-xs text-gray-300 font-poppins">{i + 1}</span>
+                            )}
+                            <span className={`font-lato text-sm ${i === 0 ? 'text-gray-900 font-semibold' : 'text-gray-600'} ${r.candidate.is_qualified ? '' : ''}`}>
+                              {r.candidate.name}
+                            </span>
+                            {r.candidate.is_qualified && (
+                              <span className="px-1.5 py-0.5 bg-green-50 text-green-700 text-[10px] font-semibold rounded-full">Qualifié</span>
+                            )}
+                          </div>
+                          <span className="font-poppins font-bold text-sm text-primary-900">{r.count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Niveau 3 results */}
+          <div>
+            <h4 className="font-poppins font-bold text-base text-gray-900 mb-3 flex items-center gap-2">
+              <Trophy className="w-4 h-4 text-primary-900" />
+              Résultats — Vote Inter-Classes / Finalistes (Niveau 3)
+            </h4>
+            {voteResults.level3Groups.length === 0 ? (
+              <div className="text-center py-10 bg-white rounded-2xl border border-gray-100">
+                <p className="font-lato text-gray-400">
+                  Aucun finaliste qualifié pour le moment. Activez le niveau 3 pour qualifier automatiquement les 3 premiers de chaque catégorie/classe.
+                </p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {voteResults.level3Groups.map((g) => (
+                  <div key={g.categoryId} className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+                    <p className="font-poppins font-semibold text-sm text-gray-900 mb-3">{g.categoryName}</p>
+                    <div className="space-y-2">
+                      {g.ranking.map((r, i) => (
+                        <div key={r.candidate.id} className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            {i === 0 ? (
+                              <Medal className="w-4 h-4 text-yellow-500" />
+                            ) : i === 1 ? (
+                              <Medal className="w-4 h-4 text-gray-400" />
+                            ) : i === 2 ? (
+                              <Medal className="w-4 h-4 text-orange-400" />
+                            ) : (
+                              <span className="w-4 h-4 text-center text-xs text-gray-300 font-poppins">{i + 1}</span>
+                            )}
+                            <span className={`font-lato text-sm ${i === 0 ? 'text-gray-900 font-semibold' : 'text-gray-600'}`}>
+                              {r.candidate.name}
+                            </span>
+                            <span className="font-lato text-xs text-gray-400">({r.candidate.classes?.name})</span>
+                          </div>
+                          <span className="font-poppins font-bold text-sm text-primary-900">{r.count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
