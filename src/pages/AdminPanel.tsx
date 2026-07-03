@@ -1,16 +1,21 @@
-import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
+import { useState, useMemo, useRef, useEffect } from 'react';
 import { useApp } from '../lib/context';
 import { supabase } from '../lib/supabase';
 import { uploadFile } from '../lib/upload';
 import { CommentModerationItem } from '../components/CandidateCard';
 import AdminLogin from '../components/AdminLogin';
 import { LEVEL_NAMES, LEVEL_DESCRIPTIONS } from '../lib/types';
-import type { Comment as TComment, Vote } from '../lib/types';
+import type { Comment as TComment } from '../lib/types';
 import {
   BarChart3, Users, Tag, MessageSquare, Settings, Trophy,
   ChevronRight, Plus, Trash2, CheckCircle, AlertTriangle, RefreshCw,
-  Calendar, Camera, Save, Award, Medal,
+  Calendar, Camera, Save, Crown, Medal,
 } from 'lucide-react';
+
+interface VoteRow {
+  candidate_id: string;
+  category_id: string;
+}
 
 export default function AdminPanel() {
   const {
@@ -24,35 +29,76 @@ export default function AdminPanel() {
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [processing, setProcessing] = useState(false);
 
-  // Voting results
-  const [votes, setVotes] = useState<Vote[]>([]);
-  const [totalVoters, setTotalVoters] = useState(0);
+  // Results (votes) state
+  const [resultsLevel, setResultsLevel] = useState<2 | 3>(3);
+  const [votesLevel2, setVotesLevel2] = useState<VoteRow[]>([]);
+  const [votesLevel3, setVotesLevel3] = useState<VoteRow[]>([]);
   const [resultsLoading, setResultsLoading] = useState(false);
 
-  const refreshResults = useCallback(async () => {
+  const loadResults = async () => {
     setResultsLoading(true);
     try {
-      const [votesRes, votersRes] = await Promise.all([
-        supabase.from('votes').select('*'),
-        supabase.from('voters').select('id', { count: 'exact', head: true }),
+      const [{ data: v2 }, { data: v3 }] = await Promise.all([
+        supabase.from('votes').select('candidate_id, category_id').eq('level', 2),
+        supabase.from('votes').select('candidate_id, category_id').eq('level', 3),
       ]);
-      if (votesRes.data) setVotes(votesRes.data as Vote[]);
-      if (typeof votersRes.count === 'number') setTotalVoters(votersRes.count);
+      setVotesLevel2(v2 || []);
+      setVotesLevel3(v3 || []);
     } finally {
       setResultsLoading(false);
     }
-  }, []);
+  };
 
   useEffect(() => {
-    refreshResults();
-    const channel = supabase
-      .channel('admin-results-votes')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'votes' }, () => {
-        refreshResults();
-      })
-      .subscribe();
-    return () => { supabase.removeChannel(channel); };
-  }, [refreshResults]);
+    if (activeTab === 'results') loadResults();
+  }, [activeTab]);
+
+  // Vote counts per candidate for each level
+  const voteCounts2 = useMemo(() => {
+    const counts: Record<string, number> = {};
+    votesLevel2.forEach((v) => { counts[v.candidate_id] = (counts[v.candidate_id] || 0) + 1; });
+    return counts;
+  }, [votesLevel2]);
+
+  const voteCounts3 = useMemo(() => {
+    const counts: Record<string, number> = {};
+    votesLevel3.forEach((v) => { counts[v.candidate_id] = (counts[v.candidate_id] || 0) + 1; });
+    return counts;
+  }, [votesLevel3]);
+
+  // Niveau 2 : classement par classe + catégorie (vote intra-classe)
+  const resultsByClassAndCategory = useMemo(() => {
+    const groups: Record<string, { className: string; categoryName: string; candidates: { candidate: typeof candidates[number]; count: number }[] }> = {};
+    candidates.forEach((c) => {
+      const key = `${c.class_id}_${c.category_id}`;
+      if (!groups[key]) {
+        groups[key] = {
+          className: c.classes?.name || 'Classe inconnue',
+          categoryName: c.categories?.name || 'Catégorie inconnue',
+          candidates: [],
+        };
+      }
+      groups[key].candidates.push({ candidate: c, count: voteCounts2[c.id] || 0 });
+    });
+    Object.values(groups).forEach((g) => g.candidates.sort((a, b) => b.count - a.count));
+    return Object.values(groups).sort((a, b) =>
+      a.categoryName.localeCompare(b.categoryName) || a.className.localeCompare(b.className)
+    );
+  }, [candidates, voteCounts2]);
+
+  // Niveau 3 : classement final par catégorie (finalistes qualifiés) -> les gagnants
+  const resultsByCategory = useMemo(() => {
+    const groups: Record<string, { categoryName: string; candidates: { candidate: typeof candidates[number]; count: number }[] }> = {};
+    candidates.filter((c) => c.is_qualified).forEach((c) => {
+      const key = c.category_id;
+      if (!groups[key]) {
+        groups[key] = { categoryName: c.categories?.name || 'Catégorie inconnue', candidates: [] };
+      }
+      groups[key].candidates.push({ candidate: c, count: voteCounts3[c.id] || 0 });
+    });
+    Object.values(groups).forEach((g) => g.candidates.sort((a, b) => b.count - a.count));
+    return Object.values(groups).sort((a, b) => a.categoryName.localeCompare(b.categoryName));
+  }, [candidates, voteCounts3]);
 
   // Gala settings
   const [galaDate, setGalaDate] = useState(gala?.gala_date ? gala.gala_date.slice(0, 16) : '');
@@ -71,47 +117,6 @@ export default function AdminPanel() {
       count: candidates.filter((c) => c.class_id === cls.id).length,
     })),
   }), [candidates, comments, categories, classes]);
-
-  const voteResults = useMemo(() => {
-    const countFor = (level: number) => {
-      const counts: Record<string, number> = {};
-      votes.filter((v) => v.level === level).forEach((v) => {
-        counts[v.candidate_id] = (counts[v.candidate_id] || 0) + 1;
-      });
-      return counts;
-    };
-    const level2Counts = countFor(2);
-    const level3Counts = countFor(3);
-
-    const level2Voters = new Set(votes.filter((v) => v.level === 2).map((v) => v.voter_id)).size;
-    const level3Voters = new Set(votes.filter((v) => v.level === 3).map((v) => v.voter_id)).size;
-
-    // Level 2: results grouped by class then category
-    const level2Groups: { classId: string; className: string; categoryId: string; categoryName: string; ranking: { candidate: typeof candidates[number]; count: number }[] }[] = [];
-    classes.forEach((cls) => {
-      categories.forEach((cat) => {
-        const group = candidates.filter((c) => c.class_id === cls.id && c.category_id === cat.id);
-        if (group.length === 0) return;
-        const ranking = group
-          .map((candidate) => ({ candidate, count: level2Counts[candidate.id] || 0 }))
-          .sort((a, b) => b.count - a.count);
-        level2Groups.push({ classId: cls.id, className: cls.name, categoryId: cat.id, categoryName: cat.name, ranking });
-      });
-    });
-
-    // Level 3: results grouped by category (qualified/finalist candidates)
-    const level3Groups: { categoryId: string; categoryName: string; ranking: { candidate: typeof candidates[number]; count: number }[] }[] = [];
-    categories.forEach((cat) => {
-      const group = candidates.filter((c) => c.category_id === cat.id && c.is_qualified);
-      if (group.length === 0) return;
-      const ranking = group
-        .map((candidate) => ({ candidate, count: level3Counts[candidate.id] || 0 }))
-        .sort((a, b) => b.count - a.count);
-      level3Groups.push({ categoryId: cat.id, categoryName: cat.name, ranking });
-    });
-
-    return { level2Voters, level3Voters, level2Groups, level3Groups };
-  }, [votes, candidates, categories, classes]);
 
   if (!isAdmin) {
     return <AdminLogin onLogin={() => setAdmin(true)} />;
@@ -254,7 +259,7 @@ export default function AdminPanel() {
     { id: 'categories' as const, label: 'Catégories & Classes', icon: Tag },
     { id: 'comments' as const, label: 'Commentaires', icon: MessageSquare },
     { id: 'candidates' as const, label: 'Candidats', icon: Users },
-    { id: 'results' as const, label: 'Résultats', icon: Award },
+    { id: 'results' as const, label: 'Résultats', icon: Crown },
     { id: 'gala' as const, label: 'Grand Bal', icon: Calendar },
   ];
 
@@ -598,141 +603,161 @@ export default function AdminPanel() {
         </div>
       )}
 
-      {/* Voting Results */}
+      {/* Results */}
       {activeTab === 'results' && (
-        <div className="space-y-8">
-          <div className="flex items-center justify-between">
+        <div>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
             <h3 className="font-poppins font-bold text-lg text-gray-900">Résultats des votes</h3>
-            <button onClick={() => refreshResults()}
-              className="flex items-center gap-1.5 px-3 py-2 text-sm text-primary-900 hover:bg-primary-900/5 rounded-lg font-poppins font-medium transition-all">
-              <RefreshCw className={`w-4 h-4 ${resultsLoading ? 'animate-spin' : ''}`} /> Actualiser
-            </button>
-          </div>
-
-          {/* Participation par étape */}
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-              <p className="font-poppins font-medium text-sm text-gray-500 mb-2">Votants inscrits</p>
-              <p className="font-poppins font-bold text-3xl text-gray-900">{totalVoters}</p>
-            </div>
-            <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-              <p className="font-poppins font-medium text-sm text-gray-500 mb-2">
-                Niveau 2 — Vote Intra-Classes
-              </p>
-              <p className="font-poppins font-bold text-3xl text-gray-900">
-                {voteResults.level2Voters}
-                <span className="text-base font-medium text-gray-400"> / {totalVoters}</span>
-              </p>
-              <div className="h-2 bg-gray-100 rounded-full overflow-hidden mt-2">
-                <div className="h-full bg-primary-900 rounded-full"
-                  style={{ width: `${totalVoters > 0 ? (voteResults.level2Voters / totalVoters) * 100 : 0}%` }} />
+            <div className="flex items-center gap-2">
+              <div className="flex bg-gray-100 rounded-xl p-1">
+                <button
+                  onClick={() => setResultsLevel(3)}
+                  className={`px-4 py-2 rounded-lg text-sm font-poppins font-medium transition-all ${
+                    resultsLevel === 3 ? 'bg-white shadow-sm text-primary-900' : 'text-gray-500'
+                  }`}
+                >
+                  Finale (Niveau 3)
+                </button>
+                <button
+                  onClick={() => setResultsLevel(2)}
+                  className={`px-4 py-2 rounded-lg text-sm font-poppins font-medium transition-all ${
+                    resultsLevel === 2 ? 'bg-white shadow-sm text-primary-900' : 'text-gray-500'
+                  }`}
+                >
+                  Intra-classes (Niveau 2)
+                </button>
               </div>
-            </div>
-            <div className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-              <p className="font-poppins font-medium text-sm text-gray-500 mb-2">
-                Niveau 3 — Vote Inter-Classes
-              </p>
-              <p className="font-poppins font-bold text-3xl text-gray-900">
-                {voteResults.level3Voters}
-                <span className="text-base font-medium text-gray-400"> / {totalVoters}</span>
-              </p>
-              <div className="h-2 bg-gray-100 rounded-full overflow-hidden mt-2">
-                <div className="h-full bg-primary-900 rounded-full"
-                  style={{ width: `${totalVoters > 0 ? (voteResults.level3Voters / totalVoters) * 100 : 0}%` }} />
-              </div>
+              <button onClick={() => loadResults()}
+                className="flex items-center gap-1.5 px-3 py-2 text-sm text-primary-900 hover:bg-primary-900/5 rounded-lg font-poppins font-medium transition-all">
+                <RefreshCw className={`w-4 h-4 ${resultsLoading ? 'animate-spin' : ''}`} /> Actualiser
+              </button>
             </div>
           </div>
 
-          {/* Niveau 2 results */}
-          <div>
-            <h4 className="font-poppins font-bold text-base text-gray-900 mb-3 flex items-center gap-2">
-              <BarChart3 className="w-4 h-4 text-primary-900" />
-              Résultats — Vote Intra-Classes (Niveau 2)
-            </h4>
-            {voteResults.level2Groups.length === 0 ? (
-              <div className="text-center py-10 bg-white rounded-2xl border border-gray-100">
-                <p className="font-lato text-gray-400">Aucun candidat inscrit pour le moment.</p>
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {voteResults.level2Groups.map((g) => (
-                  <div key={`${g.classId}_${g.categoryId}`} className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-                    <p className="font-poppins font-semibold text-sm text-gray-900 mb-0.5">{g.categoryName}</p>
-                    <p className="font-lato text-xs text-gray-400 mb-3">{g.className}</p>
-                    <div className="space-y-2">
-                      {g.ranking.map((r, i) => (
-                        <div key={r.candidate.id} className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            {i === 0 ? (
-                              <Medal className="w-4 h-4 text-yellow-500" />
-                            ) : i === 1 ? (
-                              <Medal className="w-4 h-4 text-gray-400" />
-                            ) : i === 2 ? (
-                              <Medal className="w-4 h-4 text-orange-400" />
-                            ) : (
-                              <span className="w-4 h-4 text-center text-xs text-gray-300 font-poppins">{i + 1}</span>
-                            )}
-                            <span className={`font-lato text-sm ${i === 0 ? 'text-gray-900 font-semibold' : 'text-gray-600'} ${r.candidate.is_qualified ? '' : ''}`}>
-                              {r.candidate.name}
-                            </span>
-                            {r.candidate.is_qualified && (
-                              <span className="px-1.5 py-0.5 bg-green-50 text-green-700 text-[10px] font-semibold rounded-full">Qualifié</span>
-                            )}
-                          </div>
-                          <span className="font-poppins font-bold text-sm text-primary-900">{r.count}</span>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-
-          {/* Niveau 3 results */}
-          <div>
-            <h4 className="font-poppins font-bold text-base text-gray-900 mb-3 flex items-center gap-2">
-              <Trophy className="w-4 h-4 text-primary-900" />
-              Résultats — Vote Inter-Classes / Finalistes (Niveau 3)
-            </h4>
-            {voteResults.level3Groups.length === 0 ? (
-              <div className="text-center py-10 bg-white rounded-2xl border border-gray-100">
-                <p className="font-lato text-gray-400">
-                  Aucun finaliste qualifié pour le moment. Activez le niveau 3 pour qualifier automatiquement les 3 premiers de chaque catégorie/classe.
+          {resultsLoading ? (
+            <div className="text-center py-16">
+              <RefreshCw className="w-8 h-8 text-gray-300 mx-auto mb-3 animate-spin" />
+              <p className="font-poppins text-gray-400">Chargement des résultats...</p>
+            </div>
+          ) : resultsLevel === 3 ? (
+            resultsByCategory.length === 0 ? (
+              <div className="text-center py-16 bg-white rounded-2xl border border-gray-100">
+                <Crown className="w-12 h-12 text-gray-200 mx-auto mb-3" />
+                <p className="font-poppins text-gray-400">
+                  Aucun finaliste qualifié pour l'instant. Passez au niveau 3 pour qualifier les finalistes.
                 </p>
               </div>
             ) : (
-              <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {voteResults.level3Groups.map((g) => (
-                  <div key={g.categoryId} className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
-                    <p className="font-poppins font-semibold text-sm text-gray-900 mb-3">{g.categoryName}</p>
-                    <div className="space-y-2">
-                      {g.ranking.map((r, i) => (
-                        <div key={r.candidate.id} className="flex items-center justify-between">
-                          <div className="flex items-center gap-2">
-                            {i === 0 ? (
-                              <Medal className="w-4 h-4 text-yellow-500" />
-                            ) : i === 1 ? (
-                              <Medal className="w-4 h-4 text-gray-400" />
-                            ) : i === 2 ? (
-                              <Medal className="w-4 h-4 text-orange-400" />
-                            ) : (
-                              <span className="w-4 h-4 text-center text-xs text-gray-300 font-poppins">{i + 1}</span>
-                            )}
-                            <span className={`font-lato text-sm ${i === 0 ? 'text-gray-900 font-semibold' : 'text-gray-600'}`}>
-                              {r.candidate.name}
-                            </span>
-                            <span className="font-lato text-xs text-gray-400">({r.candidate.classes?.name})</span>
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                {resultsByCategory.map((group) => {
+                  const totalVotes = group.candidates.reduce((sum, c) => sum + c.count, 0);
+                  const winner = group.candidates[0];
+                  return (
+                    <div key={group.categoryName} className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+                      <div className="flex items-center justify-between mb-4">
+                        <h4 className="font-poppins font-bold text-gray-900">{group.categoryName}</h4>
+                        <span className="font-lato text-xs text-gray-400">{totalVotes} vote{totalVotes !== 1 ? 's' : ''}</span>
+                      </div>
+
+                      {winner && winner.count > 0 && (
+                        <div className="flex items-center gap-3 mb-4 p-3 rounded-xl bg-yellow-50 border border-yellow-200">
+                          <div className="w-10 h-10 rounded-xl bg-yellow-400 flex items-center justify-center flex-shrink-0">
+                            <Crown className="w-5 h-5 text-white" />
                           </div>
-                          <span className="font-poppins font-bold text-sm text-primary-900">{r.count}</span>
+                          <div className="min-w-0">
+                            <p className="font-poppins font-bold text-sm text-yellow-800 truncate">
+                              🏆 {winner.candidate.name}
+                            </p>
+                            <p className="font-lato text-xs text-yellow-700">
+                              Gagnant · {winner.count} vote{winner.count !== 1 ? 's' : ''}
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="space-y-2">
+                        {group.candidates.map((c, idx) => (
+                          <div key={c.candidate.id} className="flex items-center gap-3">
+                            <span className={`w-5 text-xs font-poppins font-semibold text-right ${
+                              idx === 0 ? 'text-yellow-600' : 'text-gray-400'
+                            }`}>
+                              {idx + 1}
+                            </span>
+                            <span className="flex-1 font-lato text-sm text-gray-700 truncate">{c.candidate.name}</span>
+                            <div className="w-24 h-2 bg-gray-100 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full rounded-full ${idx === 0 ? 'bg-yellow-400' : 'bg-primary-900'}`}
+                                style={{ width: `${totalVotes > 0 ? (c.count / totalVotes) * 100 : 0}%` }}
+                              />
+                            </div>
+                            <span className="w-6 text-right font-poppins font-semibold text-xs text-gray-700">{c.count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )
+          ) : resultsByClassAndCategory.length === 0 ? (
+            <div className="text-center py-16 bg-white rounded-2xl border border-gray-100">
+              <Medal className="w-12 h-12 text-gray-200 mx-auto mb-3" />
+              <p className="font-poppins text-gray-400">Aucun candidat enregistré pour l'instant.</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+              {resultsByClassAndCategory.map((group) => {
+                const totalVotes = group.candidates.reduce((sum, c) => sum + c.count, 0);
+                const winner = group.candidates[0];
+                return (
+                  <div key={`${group.className}_${group.categoryName}`} className="bg-white rounded-2xl p-5 shadow-sm border border-gray-100">
+                    <div className="flex items-center justify-between mb-3">
+                      <div>
+                        <h4 className="font-poppins font-bold text-gray-900">{group.categoryName}</h4>
+                        <p className="font-lato text-xs text-gray-400">{group.className}</p>
+                      </div>
+                      <span className="font-lato text-xs text-gray-400">{totalVotes} vote{totalVotes !== 1 ? 's' : ''}</span>
+                    </div>
+
+                    {winner && winner.count > 0 && (
+                      <div className="flex items-center gap-2 mb-3 text-sm">
+                        <Medal className="w-4 h-4 text-yellow-500 flex-shrink-0" />
+                        <span className="font-poppins font-semibold text-gray-800 truncate">{winner.candidate.name}</span>
+                        <span className="font-lato text-xs text-gray-400">({winner.count} vote{winner.count !== 1 ? 's' : ''})</span>
+                      </div>
+                    )}
+
+                    <div className="space-y-2">
+                      {group.candidates.map((c, idx) => (
+                        <div key={c.candidate.id} className="flex items-center gap-3">
+                          <span className={`w-5 text-xs font-poppins font-semibold text-right ${
+                            idx === 0 ? 'text-yellow-600' : 'text-gray-400'
+                          }`}>
+                            {idx + 1}
+                          </span>
+                          <span className={`flex-1 font-lato text-sm truncate ${
+                            c.candidate.is_qualified ? 'text-gray-900 font-medium' : 'text-gray-500'
+                          }`}>
+                            {c.candidate.name}
+                            {c.candidate.is_qualified && (
+                              <CheckCircle className="w-3.5 h-3.5 text-green-500 inline ml-1.5" />
+                            )}
+                          </span>
+                          <div className="w-24 h-2 bg-gray-100 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full rounded-full ${idx === 0 ? 'bg-yellow-400' : 'bg-primary-900'}`}
+                              style={{ width: `${totalVotes > 0 ? (c.count / totalVotes) * 100 : 0}%` }}
+                            />
+                          </div>
+                          <span className="w-6 text-right font-poppins font-semibold text-xs text-gray-700">{c.count}</span>
                         </div>
                       ))}
                     </div>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
